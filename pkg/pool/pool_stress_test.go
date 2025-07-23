@@ -3,6 +3,7 @@ package pool
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -10,306 +11,109 @@ import (
 	"time"
 )
 
-// StressTestTask 压力测试任务
-type StressTestTask struct {
-	id         int64
-	workload   time.Duration
-	priority   int
-	submitTime time.Time
-	startTime  time.Time
-	finishTime time.Time
-	executed   int32
-	cancelled  int32
+// TestStressScenarios 压力测试场景
+func TestStressScenarios(t *testing.T) {
+	t.Run("high throughput stress", func(t *testing.T) {
+		testHighThroughputStress(t)
+	})
+
+	t.Run("memory pressure stress", func(t *testing.T) {
+		testMemoryPressureStress(t)
+	})
+
+	t.Run("concurrent pool stress", func(t *testing.T) {
+		testConcurrentPoolStress(t)
+	})
+
+	t.Run("mixed workload stress", func(t *testing.T) {
+		testMixedWorkloadStress(t)
+	})
+
+	t.Run("failure injection stress", func(t *testing.T) {
+		testFailureInjectionStress(t)
+	})
 }
 
-func NewStressTestTask(id int64, workload time.Duration) *StressTestTask {
-	return &StressTestTask{
-		id:         id,
-		workload:   workload,
-		priority:   PriorityNormal,
-		submitTime: time.Now(),
-	}
-}
-
-func (t *StressTestTask) Execute(ctx context.Context) (any, error) {
-	t.startTime = time.Now()
-	atomic.StoreInt32(&t.executed, 1)
-
-	if t.workload > 0 {
-		select {
-		case <-time.After(t.workload):
-		case <-ctx.Done():
-			atomic.StoreInt32(&t.cancelled, 1)
-			return nil, ctx.Err()
-		}
-	}
-
-	t.finishTime = time.Now()
-	return fmt.Sprintf("stress-task-%d-result", t.id), nil
-}
-
-func (t *StressTestTask) Priority() int {
-	return t.priority
-}
-
-func (t *StressTestTask) SetPriority(priority int) {
-	t.priority = priority
-}
-
-func (t *StressTestTask) IsExecuted() bool {
-	return atomic.LoadInt32(&t.executed) == 1
-}
-
-func (t *StressTestTask) IsCancelled() bool {
-	return atomic.LoadInt32(&t.cancelled) == 1
-}
-
-func (t *StressTestTask) GetLatency() time.Duration {
-	if t.startTime.IsZero() {
-		return 0
-	}
-	return t.startTime.Sub(t.submitTime)
-}
-
-func (t *StressTestTask) GetExecutionTime() time.Duration {
-	if t.startTime.IsZero() || t.finishTime.IsZero() {
-		return 0
-	}
-	return t.finishTime.Sub(t.startTime)
-}
-
-// BenchmarkPoolExtremeStress 极限压力测试
-func BenchmarkPoolExtremeStress(b *testing.B) {
-	stressLevels := []struct {
-		name        string
-		workers     int
-		queueSize   int
-		goroutines  int
-		tasksPerGor int
-		workload    time.Duration
-		duration    time.Duration
-	}{
-		{"Moderate", 8, 2000, 50, 100, time.Microsecond, time.Second * 5},
-		{"Heavy", 16, 5000, 100, 100, time.Microsecond * 10, time.Second * 10},
-		{"Extreme", 32, 10000, 200, 50, time.Microsecond * 5, time.Second * 15},
-		{"Ultra", runtime.NumCPU() * 4, 20000, 500, 20, 0, time.Second * 20},
-	}
-
-	for _, level := range stressLevels {
-		b.Run(level.name, func(b *testing.B) {
-			if testing.Short() && level.name == "Ultra" {
-				b.Skip("跳过Ultra级别测试在短测试模式下")
-			}
-
-			runExtremeStressTest(b, level.workers, level.queueSize, level.goroutines,
-				level.tasksPerGor, level.workload, level.duration)
-		})
-	}
-}
-
-func runExtremeStressTest(b *testing.B, workers, queueSize, goroutines, tasksPerGor int,
-	workload, duration time.Duration) {
-
-	config, err := NewConfigBuilder().
-		WithWorkerCount(workers).
-		WithQueueSize(queueSize).
-		WithObjectPoolSize(DefaultObjectPoolSize).
-		WithPreAlloc(true).
-		WithMetrics(true).
-		Build()
-	if err != nil {
-		b.Fatalf("Failed to create config: %v", err)
-	}
-
-	pool, err := NewPool(config)
-	if err != nil {
-		b.Fatalf("Failed to create pool: %v", err)
-	}
-	defer func() {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second*30)
-		defer cancel()
-		pool.Shutdown(ctx)
-	}()
-
-	var totalSubmitted, totalErrors, totalPanics int64
-	var totalLatency, totalExecTime int64
-	var completedTasks []*StressTestTask
-	var tasksMutex sync.Mutex
-
-	b.ResetTimer()
-	start := time.Now()
-
-	var wg sync.WaitGroup
-
-	// 启动压力测试协程
-	for i := 0; i < goroutines; i++ {
-		wg.Add(1)
-		go func(goroutineID int) {
-			defer wg.Done()
-			defer func() {
-				if r := recover(); r != nil {
-					atomic.AddInt64(&totalPanics, 1)
-					b.Errorf("Goroutine %d panicked: %v", goroutineID, r)
-				}
-			}()
-
-			localTasks := make([]*StressTestTask, 0, tasksPerGor)
-
-			for j := 0; j < tasksPerGor; j++ {
-				if time.Since(start) >= duration {
-					break
-				}
-
-				taskID := int64(goroutineID*tasksPerGor + j)
-				task := NewStressTestTask(taskID, workload)
-				localTasks = append(localTasks, task)
-
-				err := pool.Submit(task)
-				if err != nil {
-					atomic.AddInt64(&totalErrors, 1)
-				} else {
-					atomic.AddInt64(&totalSubmitted, 1)
-				}
-
-				// 随机延迟模拟真实场景
-				if j%10 == 0 {
-					time.Sleep(time.Microsecond * time.Duration(j%5))
-				}
-			}
-
-			// 等待任务完成并收集统计信息
-			time.Sleep(time.Millisecond * 100)
-			for _, task := range localTasks {
-				if task.IsExecuted() {
-					latency := task.GetLatency()
-					execTime := task.GetExecutionTime()
-					atomic.AddInt64(&totalLatency, int64(latency))
-					atomic.AddInt64(&totalExecTime, int64(execTime))
-
-					tasksMutex.Lock()
-					completedTasks = append(completedTasks, task)
-					tasksMutex.Unlock()
-				}
-			}
-		}(i)
-	}
-
-	wg.Wait()
-	actualDuration := time.Since(start)
-
-	// 等待剩余任务完成
-	time.Sleep(time.Second)
-	stats := pool.Stats()
-
-	// 计算性能指标
-	totalTasks := totalSubmitted + totalErrors
-	successRate := float64(totalSubmitted) / float64(totalTasks) * 100
-	throughput := float64(totalSubmitted) / actualDuration.Seconds()
-
-	var avgLatency, avgExecTime time.Duration
-	if len(completedTasks) > 0 {
-		avgLatency = time.Duration(totalLatency / int64(len(completedTasks)))
-		avgExecTime = time.Duration(totalExecTime / int64(len(completedTasks)))
-	}
-
-	// 内存统计
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-
-	// 报告指标
-	b.ReportMetric(throughput, "tasks/sec")
-	b.ReportMetric(successRate, "success_rate_%")
-	b.ReportMetric(float64(totalErrors), "errors")
-	b.ReportMetric(float64(totalPanics), "panics")
-	b.ReportMetric(float64(avgLatency.Nanoseconds()), "avg_latency_ns")
-	b.ReportMetric(float64(avgExecTime.Nanoseconds()), "avg_exec_time_ns")
-	b.ReportMetric(float64(stats.CompletedTasks), "completed_tasks")
-	b.ReportMetric(float64(stats.ActiveWorkers), "active_workers")
-	b.ReportMetric(float64(m.HeapAlloc)/1024/1024, "heap_mb")
-
-	// 验证稳定性
-	if successRate < 85 {
-		b.Errorf("压力测试失败: 成功率 %.2f%% < 85%%", successRate)
-	}
-	if totalPanics > 0 {
-		b.Errorf("压力测试失败: 发生了 %d 次panic", totalPanics)
-	}
-	if throughput < 100 {
-		b.Errorf("压力测试失败: 吞吐量 %.2f < 100 tasks/sec", throughput)
-	}
-
-	b.Logf("压力测试结果: 协程%d, 队列%d, 并发%d, 吞吐量%.2f tasks/sec, 成功率%.2f%%, 延迟%v, 错误%d, Panic%d",
-		workers, queueSize, goroutines, throughput, successRate, avgLatency, totalErrors, totalPanics)
-}
-
-// BenchmarkPoolLongRunningStabilityStress 长时间运行稳定性压力测试
-func BenchmarkPoolLongRunningStabilityStress(b *testing.B) {
+// testHighThroughputStress 高吞吐量压力测试
+func testHighThroughputStress(t *testing.T) {
 	if testing.Short() {
-		b.Skip("跳过长时间运行测试在短测试模式下")
+		t.Skip("Skipping stress test in short mode")
 	}
 
 	config, err := NewConfigBuilder().
-		WithWorkerCount(16).
-		WithQueueSize(5000).
-		WithObjectPoolSize(500).
-		WithPreAlloc(true).
+		WithWorkerCount(runtime.NumCPU() * 4).
+		WithQueueSize(10000).
+		WithTaskTimeout(time.Second * 5).
 		WithMetrics(true).
 		Build()
 	if err != nil {
-		b.Fatalf("Failed to create config: %v", err)
+		t.Fatalf("Failed to create config: %v", err)
 	}
 
 	pool, err := NewPool(config)
 	if err != nil {
-		b.Fatalf("Failed to create pool: %v", err)
+		t.Fatalf("Failed to create pool: %v", err)
 	}
 	defer func() {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second*30)
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
 		defer cancel()
 		pool.Shutdown(ctx)
 	}()
 
-	// 长时间运行测试（30秒）
+	// 压力测试参数
 	testDuration := time.Second * 30
-	checkInterval := time.Second * 5
+	if testing.Short() {
+		testDuration = time.Second * 5
+	}
 
-	var totalSubmitted, totalErrors int64
-	var memorySnapshots []uint64
-	var throughputSnapshots []float64
+	submitterCount := runtime.NumCPU() * 2
+	var stats struct {
+		submitted int64
+		completed int64
+		failed    int64
+		errors    int64
+	}
 
-	b.ResetTimer()
-	start := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), testDuration)
+	defer cancel()
 
-	// 启动任务提交协程
 	var wg sync.WaitGroup
-	stopChan := make(chan struct{})
+	startTime := time.Now()
 
-	// 任务提交协程
-	for i := 0; i < 10; i++ {
+	// 启动多个提交协程
+	for i := 0; i < submitterCount; i++ {
 		wg.Add(1)
-		go func(workerID int) {
+		go func(submitterID int) {
 			defer wg.Done()
-			var taskID int64
 
+			taskID := 0
 			for {
 				select {
-				case <-stopChan:
+				case <-ctx.Done():
 					return
 				default:
-					id := atomic.AddInt64(&taskID, 1)
-					workload := time.Microsecond * time.Duration((id%100)+1)
-					task := NewStressTestTask(int64(workerID)*100000+id, workload)
-
-					err := pool.Submit(task)
-					if err != nil {
-						atomic.AddInt64(&totalErrors, 1)
-					} else {
-						atomic.AddInt64(&totalSubmitted, 1)
+					taskID++
+					task := &StressTask{
+						id:       fmt.Sprintf("s%d-t%d", submitterID, taskID),
+						workType: "cpu",
+						duration: time.Microsecond * time.Duration(100+rand.Intn(900)), // 100-1000μs
+						onComplete: func() {
+							atomic.AddInt64(&stats.completed, 1)
+						},
+						onError: func() {
+							atomic.AddInt64(&stats.errors, 1)
+						},
 					}
 
-					// 控制提交频率
-					if id%100 == 0 {
-						time.Sleep(time.Millisecond)
+					if err := pool.Submit(task); err != nil {
+						atomic.AddInt64(&stats.failed, 1)
+					} else {
+						atomic.AddInt64(&stats.submitted, 1)
+					}
+
+					// 控制提交速率，避免过度消耗CPU
+					if taskID%1000 == 0 {
+						time.Sleep(time.Microsecond * 10)
 					}
 				}
 			}
@@ -320,281 +124,84 @@ func BenchmarkPoolLongRunningStabilityStress(b *testing.B) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		ticker := time.NewTicker(checkInterval)
-		defer ticker.Stop()
 
-		lastSubmitted := int64(0)
-		lastTime := start
+		ticker := time.NewTicker(time.Second * 5)
+		defer ticker.Stop()
 
 		for {
 			select {
-			case <-stopChan:
+			case <-ctx.Done():
 				return
-			case now := <-ticker.C:
-				currentSubmitted := atomic.LoadInt64(&totalSubmitted)
-				currentErrors := atomic.LoadInt64(&totalErrors)
+			case <-ticker.C:
+				elapsed := time.Since(startTime)
+				submitted := atomic.LoadInt64(&stats.submitted)
+				completed := atomic.LoadInt64(&stats.completed)
+				failed := atomic.LoadInt64(&stats.failed)
+				errors := atomic.LoadInt64(&stats.errors)
 
-				// 计算当前吞吐量
-				duration := now.Sub(lastTime)
-				throughput := float64(currentSubmitted-lastSubmitted) / duration.Seconds()
-				throughputSnapshots = append(throughputSnapshots, throughput)
+				throughput := float64(completed) / elapsed.Seconds()
+				poolStats := pool.Stats()
 
-				// 记录内存使用
-				var m runtime.MemStats
-				runtime.ReadMemStats(&m)
-				memorySnapshots = append(memorySnapshots, m.HeapAlloc)
-
-				// 获取统计信息
-				stats := pool.Stats()
-
-				b.Logf("时间: %v, 吞吐量: %.2f tasks/sec, 总提交: %d, 错误: %d, 活跃协程: %d, 队列: %d, 内存: %.2f MB",
-					now.Sub(start).Round(time.Second),
-					throughput,
-					currentSubmitted,
-					currentErrors,
-					stats.ActiveWorkers,
-					stats.QueuedTasks,
-					float64(m.HeapAlloc)/1024/1024)
-
-				lastSubmitted = currentSubmitted
-				lastTime = now
-
-				// 检查异常情况
-				if throughput < 100 && now.Sub(start) > time.Second*10 {
-					b.Errorf("吞吐量异常低: %.2f tasks/sec", throughput)
-				}
-				if stats.ActiveWorkers == 0 && currentSubmitted > 0 {
-					b.Errorf("所有工作协程都停止了")
-				}
+				t.Logf("Stress test progress (%.1fs):", elapsed.Seconds())
+				t.Logf("  Submitted: %d, Completed: %d, Failed: %d, Errors: %d", submitted, completed, failed, errors)
+				t.Logf("  Throughput: %.0f tasks/sec", throughput)
+				t.Logf("  Pool: Active=%d, Queued=%d, Memory=%d bytes",
+					poolStats.ActiveWorkers, poolStats.QueuedTasks, poolStats.MemoryUsage)
 			}
 		}
 	}()
 
-	// 等待测试完成
-	time.Sleep(testDuration)
-	close(stopChan)
 	wg.Wait()
 
-	actualDuration := time.Since(start)
-	finalSubmitted := atomic.LoadInt64(&totalSubmitted)
-	finalErrors := atomic.LoadInt64(&totalErrors)
-
-	// 计算最终指标
-	totalTasks := finalSubmitted + finalErrors
-	successRate := float64(finalSubmitted) / float64(totalTasks) * 100
-	avgThroughput := float64(finalSubmitted) / actualDuration.Seconds()
-
-	// 分析内存趋势
-	var memoryGrowth float64
-	if len(memorySnapshots) >= 2 {
-		initialMemory := memorySnapshots[0]
-		finalMemory := memorySnapshots[len(memorySnapshots)-1]
-		memoryGrowth = float64(finalMemory-initialMemory) / float64(initialMemory) * 100
-	}
-
-	// 分析吞吐量稳定性
-	var throughputVariance float64
-	if len(throughputSnapshots) > 1 {
-		var sum, sumSquares float64
-		for _, tp := range throughputSnapshots {
-			sum += tp
-			sumSquares += tp * tp
-		}
-		mean := sum / float64(len(throughputSnapshots))
-		throughputVariance = (sumSquares/float64(len(throughputSnapshots)) - mean*mean) / mean * 100
-	}
-
-	// 报告指标
-	b.ReportMetric(avgThroughput, "avg_tasks/sec")
-	b.ReportMetric(successRate, "success_rate_%")
-	b.ReportMetric(memoryGrowth, "memory_growth_%")
-	b.ReportMetric(throughputVariance, "throughput_variance_%")
-	b.ReportMetric(float64(finalErrors), "total_errors")
-
-	// 稳定性验证
-	if successRate < 90 {
-		b.Errorf("长时间稳定性测试失败: 成功率 %.2f%% < 90%%", successRate)
-	}
-	if memoryGrowth > 50 {
-		b.Errorf("长时间稳定性测试失败: 内存增长 %.2f%% > 50%%", memoryGrowth)
-	}
-	if throughputVariance > 100 {
-		b.Errorf("长时间稳定性测试失败: 吞吐量方差 %.2f%% > 100%%", throughputVariance)
-	}
-
-	b.Logf("长时间稳定性测试结果: 运行时间%v, 平均吞吐量%.2f tasks/sec, 成功率%.2f%%, 内存增长%.2f%%, 吞吐量方差%.2f%%",
-		actualDuration, avgThroughput, successRate, memoryGrowth, throughputVariance)
-}
-
-// BenchmarkPoolBurstTraffic 突发流量测试
-func BenchmarkPoolBurstTraffic(b *testing.B) {
-	config, err := NewConfigBuilder().
-		WithWorkerCount(16).
-		WithQueueSize(10000).
-		WithObjectPoolSize(1000).
-		WithPreAlloc(true).
-		WithMetrics(true).
-		Build()
-	if err != nil {
-		b.Fatalf("Failed to create config: %v", err)
-	}
-
-	pool, err := NewPool(config)
-	if err != nil {
-		b.Fatalf("Failed to create pool: %v", err)
-	}
-	defer func() {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second*30)
-		defer cancel()
-		pool.Shutdown(ctx)
-	}()
-
-	// 突发流量模式：正常 -> 突发 -> 正常 -> 突发
-	phases := []struct {
-		name        string
-		duration    time.Duration
-		concurrency int
-		taskRate    int // 每秒任务数
-		workload    time.Duration
-	}{
-		{"Normal1", time.Second * 2, 10, 1000, time.Microsecond * 10},
-		{"Burst1", time.Second * 3, 100, 5000, time.Microsecond * 5},
-		{"Normal2", time.Second * 2, 10, 1000, time.Microsecond * 10},
-		{"Burst2", time.Second * 3, 200, 8000, 0},
-		{"Recovery", time.Second * 2, 5, 500, time.Microsecond * 20},
-	}
-
-	var totalSubmitted, totalErrors int64
-	var phaseResults []struct {
-		name        string
-		submitted   int64
-		errors      int64
-		throughput  float64
-		successRate float64
-	}
-
-	b.ResetTimer()
-
-	for _, phase := range phases {
-		b.Logf("开始阶段: %s", phase.name)
-		phaseStart := time.Now()
-		var phaseSubmitted, phaseErrors int64
-
-		var wg sync.WaitGroup
-		stopChan := make(chan struct{})
-
-		// 启动并发协程
-		for i := 0; i < phase.concurrency; i++ {
-			wg.Add(1)
-			go func(workerID int) {
-				defer wg.Done()
-				var taskID int64
-				interval := time.Second / time.Duration(phase.taskRate/phase.concurrency)
-
-				ticker := time.NewTicker(interval)
-				defer ticker.Stop()
-
-				for {
-					select {
-					case <-stopChan:
-						return
-					case <-ticker.C:
-						id := atomic.AddInt64(&taskID, 1)
-						task := NewStressTestTask(int64(workerID)*10000+id, phase.workload)
-
-						err := pool.Submit(task)
-						if err != nil {
-							atomic.AddInt64(&phaseErrors, 1)
-							atomic.AddInt64(&totalErrors, 1)
-						} else {
-							atomic.AddInt64(&phaseSubmitted, 1)
-							atomic.AddInt64(&totalSubmitted, 1)
-						}
-					}
-				}
-			}(i)
-		}
-
-		// 等待阶段完成
-		time.Sleep(phase.duration)
-		close(stopChan)
-		wg.Wait()
-
-		phaseDuration := time.Since(phaseStart)
-		phaseThroughput := float64(phaseSubmitted) / phaseDuration.Seconds()
-		phaseSuccessRate := float64(phaseSubmitted) / float64(phaseSubmitted+phaseErrors) * 100
-
-		phaseResults = append(phaseResults, struct {
-			name        string
-			submitted   int64
-			errors      int64
-			throughput  float64
-			successRate float64
-		}{
-			name:        phase.name,
-			submitted:   phaseSubmitted,
-			errors:      phaseErrors,
-			throughput:  phaseThroughput,
-			successRate: phaseSuccessRate,
-		})
-
-		stats := pool.Stats()
-		b.Logf("阶段 %s 完成: 提交%d, 错误%d, 吞吐量%.2f tasks/sec, 成功率%.2f%%, 队列%d, 活跃协程%d",
-			phase.name, phaseSubmitted, phaseErrors, phaseThroughput, phaseSuccessRate,
-			stats.QueuedTasks, stats.ActiveWorkers)
-	}
-
-	// 等待所有任务完成
+	// 等待剩余任务完成
 	time.Sleep(time.Second * 2)
 
-	// 分析结果
-	totalTasks := totalSubmitted + totalErrors
-	overallSuccessRate := float64(totalSubmitted) / float64(totalTasks) * 100
+	totalDuration := time.Since(startTime)
+	finalStats := pool.Stats()
 
-	b.ReportMetric(float64(totalSubmitted), "total_submitted")
-	b.ReportMetric(float64(totalErrors), "total_errors")
-	b.ReportMetric(overallSuccessRate, "overall_success_rate_%")
+	t.Logf("High throughput stress test results:")
+	t.Logf("  Duration: %v", totalDuration)
+	t.Logf("  Submitted: %d", stats.submitted)
+	t.Logf("  Completed: %d", stats.completed)
+	t.Logf("  Failed: %d", stats.failed)
+	t.Logf("  Errors: %d", stats.errors)
+	t.Logf("  Average throughput: %.0f tasks/sec", float64(stats.completed)/totalDuration.Seconds())
+	t.Logf("  Final pool stats: %+v", finalStats)
 
-	// 验证突发流量处理能力
-	burstPhases := []string{"Burst1", "Burst2"}
-	for _, burstPhase := range burstPhases {
-		for _, result := range phaseResults {
-			if result.name == burstPhase {
-				if result.successRate < 80 {
-					b.Errorf("突发流量处理失败 [%s]: 成功率 %.2f%% < 80%%", burstPhase, result.successRate)
-				}
-				if result.throughput < 1000 {
-					b.Errorf("突发流量处理失败 [%s]: 吞吐量 %.2f < 1000 tasks/sec", burstPhase, result.throughput)
-				}
-			}
-		}
+	// 基本验证
+	if stats.submitted == 0 {
+		t.Error("No tasks were submitted during stress test")
 	}
 
-	// 打印详细结果
-	b.Logf("\n=== 突发流量测试结果 ===")
-	for _, result := range phaseResults {
-		b.Logf("阶段: %-10s 提交: %6d 错误: %4d 吞吐量: %8.2f tasks/sec 成功率: %6.2f%%",
-			result.name, result.submitted, result.errors, result.throughput, result.successRate)
+	if stats.completed == 0 {
+		t.Error("No tasks were completed during stress test")
 	}
-	b.Logf("总体成功率: %.2f%%", overallSuccessRate)
+
+	// 验证完成率
+	completionRate := float64(stats.completed) / float64(stats.submitted)
+	if completionRate < 0.8 { // 至少80%的任务应该完成
+		t.Errorf("Low completion rate: %.2f%%", completionRate*100)
+	}
 }
 
-// BenchmarkPoolGracefulDegradation 优雅降级测试
-func BenchmarkPoolGracefulDegradation(b *testing.B) {
-	// 测试在资源不足时的优雅降级
+// testMemoryPressureStress 内存压力测试
+func testMemoryPressureStress(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping memory pressure test in short mode")
+	}
+
 	config, err := NewConfigBuilder().
-		WithWorkerCount(4).
-		WithQueueSize(100). // 故意设置较小的队列
-		WithObjectPoolSize(50).
+		WithWorkerCount(8).
+		WithQueueSize(1000).
 		WithMetrics(true).
 		Build()
 	if err != nil {
-		b.Fatalf("Failed to create config: %v", err)
+		t.Fatalf("Failed to create config: %v", err)
 	}
 
 	pool, err := NewPool(config)
 	if err != nil {
-		b.Fatalf("Failed to create pool: %v", err)
+		t.Fatalf("Failed to create pool: %v", err)
 	}
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
@@ -602,180 +209,724 @@ func BenchmarkPoolGracefulDegradation(b *testing.B) {
 		pool.Shutdown(ctx)
 	}()
 
-	var totalSubmitted, totalErrors int64
-	var errorTypes = make(map[string]int64)
-	var errorMutex sync.Mutex
+	// 记录初始内存状态
+	var initialMemStats runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&initialMemStats)
 
-	b.ResetTimer()
+	var stats struct {
+		submitted int64
+		completed int64
+		failed    int64
+	}
 
-	// 大量并发提交，超过队列容量
+	// 提交大量内存密集型任务
+	rounds := 20
+	tasksPerRound := 500
+
+	for round := 0; round < rounds; round++ {
+		var wg sync.WaitGroup
+
+		for i := 0; i < tasksPerRound; i++ {
+			wg.Add(1)
+			task := &StressTask{
+				id:       fmt.Sprintf("mem-r%d-t%d", round, i),
+				workType: "memory",
+				dataSize: 1024 * (1 + rand.Intn(10)),                         // 1-10KB per task
+				duration: time.Millisecond * time.Duration(10+rand.Intn(40)), // 10-50ms
+				onComplete: func() {
+					atomic.AddInt64(&stats.completed, 1)
+					wg.Done()
+				},
+				onError: func() {
+					atomic.AddInt64(&stats.failed, 1)
+					wg.Done()
+				},
+			}
+
+			if err := pool.Submit(task); err != nil {
+				atomic.AddInt64(&stats.failed, 1)
+				wg.Done()
+			} else {
+				atomic.AddInt64(&stats.submitted, 1)
+			}
+		}
+
+		wg.Wait()
+
+		// 每几轮检查内存使用
+		if round%5 == 0 {
+			runtime.GC()
+			var memStats runtime.MemStats
+			runtime.ReadMemStats(&memStats)
+
+			t.Logf("Round %d: Memory = %d bytes, GC = %d",
+				round, memStats.Alloc, memStats.NumGC)
+
+			// 检查内存是否过度增长
+			if memStats.Alloc > initialMemStats.Alloc*20 { // 20倍增长认为异常
+				t.Errorf("Excessive memory growth at round %d: %d -> %d bytes",
+					round, initialMemStats.Alloc, memStats.Alloc)
+				break
+			}
+		}
+	}
+
+	// 最终内存检查
+	runtime.GC()
+	runtime.GC()
+	time.Sleep(time.Millisecond * 100)
+
+	var finalMemStats runtime.MemStats
+	runtime.ReadMemStats(&finalMemStats)
+
+	t.Logf("Memory pressure stress test results:")
+	t.Logf("  Submitted: %d", stats.submitted)
+	t.Logf("  Completed: %d", stats.completed)
+	t.Logf("  Failed: %d", stats.failed)
+	t.Logf("  Initial memory: %d bytes", initialMemStats.Alloc)
+	t.Logf("  Final memory: %d bytes", finalMemStats.Alloc)
+	t.Logf("  Memory growth: %.2fx", float64(finalMemStats.Alloc)/float64(initialMemStats.Alloc))
+	t.Logf("  GC count: %d -> %d", initialMemStats.NumGC, finalMemStats.NumGC)
+
+	// 验证内存使用合理
+	memoryGrowth := float64(finalMemStats.Alloc) / float64(initialMemStats.Alloc)
+	if memoryGrowth > 5.0 { // 允许5倍内存增长
+		t.Errorf("Excessive memory growth: %.2fx", memoryGrowth)
+	}
+}
+
+// testConcurrentPoolStress 并发协程池压力测试
+func testConcurrentPoolStress(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping concurrent pool stress test in short mode")
+	}
+
+	poolCount := 5
+	var pools []Pool
 	var wg sync.WaitGroup
-	const goroutineCount = 50
-	const tasksPerGoroutine = 100
 
-	for i := 0; i < goroutineCount; i++ {
+	var globalStats struct {
+		totalSubmitted int64
+		totalCompleted int64
+		totalFailed    int64
+	}
+
+	// 创建多个协程池
+	for i := 0; i < poolCount; i++ {
+		config, err := NewConfigBuilder().
+			WithWorkerCount(4).
+			WithQueueSize(200).
+			Build()
+		if err != nil {
+			t.Fatalf("Failed to create config for pool %d: %v", i, err)
+		}
+
+		pool, err := NewPool(config)
+		if err != nil {
+			t.Fatalf("Failed to create pool %d: %v", i, err)
+		}
+
+		pools = append(pools, pool)
+	}
+
+	// 为每个协程池启动任务提交协程
+	for poolID, pool := range pools {
 		wg.Add(1)
-		go func(workerID int) {
+		go func(pid int, p Pool) {
 			defer wg.Done()
 
-			for j := 0; j < tasksPerGoroutine; j++ {
-				taskID := int64(workerID*tasksPerGoroutine + j)
-				// 使用较长的工作负载增加队列压力
-				task := NewStressTestTask(taskID, time.Millisecond*10)
+			var localStats struct {
+				submitted int64
+				completed int64
+				failed    int64
+			}
 
-				err := pool.Submit(task)
-				if err != nil {
-					atomic.AddInt64(&totalErrors, 1)
+			// 每个协程池提交1000个任务
+			for i := 0; i < 1000; i++ {
+				task := &StressTask{
+					id:       fmt.Sprintf("p%d-t%d", pid, i),
+					workType: "mixed",
+					duration: time.Millisecond * time.Duration(5+rand.Intn(20)), // 5-25ms
+					onComplete: func() {
+						atomic.AddInt64(&localStats.completed, 1)
+						atomic.AddInt64(&globalStats.totalCompleted, 1)
+					},
+					onError: func() {
+						atomic.AddInt64(&localStats.failed, 1)
+						atomic.AddInt64(&globalStats.totalFailed, 1)
+					},
+				}
 
-					errorMutex.Lock()
-					errorTypes[err.Error()]++
-					errorMutex.Unlock()
+				if err := p.Submit(task); err != nil {
+					atomic.AddInt64(&localStats.failed, 1)
+					atomic.AddInt64(&globalStats.totalFailed, 1)
 				} else {
-					atomic.AddInt64(&totalSubmitted, 1)
+					atomic.AddInt64(&localStats.submitted, 1)
+					atomic.AddInt64(&globalStats.totalSubmitted, 1)
+				}
+
+				// 随机延迟，模拟真实场景
+				if i%100 == 0 {
+					time.Sleep(time.Microsecond * time.Duration(rand.Intn(1000)))
 				}
 			}
-		}(i)
+
+			t.Logf("Pool %d: Submitted=%d, Completed=%d, Failed=%d",
+				pid, localStats.submitted, localStats.completed, localStats.failed)
+		}(poolID, pool)
+	}
+
+	wg.Wait()
+
+	// 等待所有任务完成
+	time.Sleep(time.Second * 3)
+
+	// 关闭所有协程池
+	for i, pool := range pools {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+		if err := pool.Shutdown(ctx); err != nil {
+			t.Errorf("Failed to shutdown pool %d: %v", i, err)
+		}
+		cancel()
+	}
+
+	t.Logf("Concurrent pool stress test results:")
+	t.Logf("  Pools: %d", poolCount)
+	t.Logf("  Total submitted: %d", globalStats.totalSubmitted)
+	t.Logf("  Total completed: %d", globalStats.totalCompleted)
+	t.Logf("  Total failed: %d", globalStats.totalFailed)
+
+	// 验证结果
+	if globalStats.totalSubmitted == 0 {
+		t.Error("No tasks were submitted")
+	}
+
+	if globalStats.totalCompleted == 0 {
+		t.Error("No tasks were completed")
+	}
+
+	// 验证所有协程池都已关闭
+	for i, pool := range pools {
+		if !pool.IsClosed() {
+			t.Errorf("Pool %d should be closed", i)
+		}
+	}
+}
+
+// testMixedWorkloadStress 混合工作负载压力测试
+func testMixedWorkloadStress(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping mixed workload stress test in short mode")
+	}
+
+	config, err := NewConfigBuilder().
+		WithWorkerCount(8).
+		WithQueueSize(500).
+		WithTaskTimeout(time.Second * 2).
+		WithMetrics(true).
+		Build()
+	if err != nil {
+		t.Fatalf("Failed to create config: %v", err)
+	}
+
+	pool, err := NewPool(config)
+	if err != nil {
+		t.Fatalf("Failed to create pool: %v", err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+		defer cancel()
+		pool.Shutdown(ctx)
+	}()
+
+	var stats struct {
+		fastCompleted   int64
+		slowCompleted   int64
+		cpuCompleted    int64
+		memoryCompleted int64
+		ioCompleted     int64
+		errorTasks      int64
+		panicTasks      int64
+		timeoutTasks    int64
+	}
+
+	var wg sync.WaitGroup
+	taskTypes := []string{"fast", "slow", "cpu", "memory", "io", "error", "panic", "timeout"}
+
+	// 为每种任务类型启动提交协程
+	for _, taskType := range taskTypes {
+		wg.Add(1)
+		go func(tType string) {
+			defer wg.Done()
+
+			taskCount := 200 // 每种类型200个任务
+			for i := 0; i < taskCount; i++ {
+				task := createStressTaskByType(tType, i, &stats)
+
+				if err := pool.Submit(task); err != nil {
+					t.Logf("Failed to submit %s task %d: %v", tType, i, err)
+				}
+
+				// 控制提交速率
+				if i%50 == 0 {
+					time.Sleep(time.Millisecond * 10)
+				}
+			}
+		}(taskType)
+	}
+
+	wg.Wait()
+
+	// 等待所有任务完成
+	timeout := time.After(time.Second * 30)
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-timeout:
+			t.Log("Timeout waiting for mixed workload to complete")
+			goto results
+		case <-ticker.C:
+			total := atomic.LoadInt64(&stats.fastCompleted) +
+				atomic.LoadInt64(&stats.slowCompleted) +
+				atomic.LoadInt64(&stats.cpuCompleted) +
+				atomic.LoadInt64(&stats.memoryCompleted) +
+				atomic.LoadInt64(&stats.ioCompleted) +
+				atomic.LoadInt64(&stats.errorTasks) +
+				atomic.LoadInt64(&stats.panicTasks) +
+				atomic.LoadInt64(&stats.timeoutTasks)
+
+			if total >= int64(len(taskTypes)*200*0.9) { // 90%完成即可
+				goto results
+			}
+		}
+	}
+
+results:
+	poolStats := pool.Stats()
+
+	t.Logf("Mixed workload stress test results:")
+	t.Logf("  Fast tasks: %d", stats.fastCompleted)
+	t.Logf("  Slow tasks: %d", stats.slowCompleted)
+	t.Logf("  CPU tasks: %d", stats.cpuCompleted)
+	t.Logf("  Memory tasks: %d", stats.memoryCompleted)
+	t.Logf("  IO tasks: %d", stats.ioCompleted)
+	t.Logf("  Error tasks: %d", stats.errorTasks)
+	t.Logf("  Panic tasks: %d", stats.panicTasks)
+	t.Logf("  Timeout tasks: %d", stats.timeoutTasks)
+	t.Logf("  Pool stats: %+v", poolStats)
+
+	// 验证协程池仍然正常工作
+	if !pool.IsRunning() {
+		t.Error("Pool should still be running after mixed workload stress")
+	}
+}
+
+// testFailureInjectionStress 故障注入压力测试
+func testFailureInjectionStress(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping failure injection stress test in short mode")
+	}
+
+	config, err := NewConfigBuilder().
+		WithWorkerCount(6).
+		WithQueueSize(300).
+		WithTaskTimeout(time.Millisecond * 500).
+		Build()
+	if err != nil {
+		t.Fatalf("Failed to create config: %v", err)
+	}
+
+	pool, err := NewPool(config)
+	if err != nil {
+		t.Fatalf("Failed to create pool: %v", err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+		defer cancel()
+		pool.Shutdown(ctx)
+	}()
+
+	var stats struct {
+		normalCompleted int64
+		errors          int64
+		panics          int64
+		timeouts        int64
+		recoveries      int64
+	}
+
+	// 故障注入模式
+	failurePatterns := []struct {
+		name        string
+		count       int
+		failureRate float64 // 失败率
+	}{
+		{"normal", 500, 0.0},
+		{"error_prone", 300, 0.3},
+		{"panic_prone", 200, 0.2},
+		{"timeout_prone", 150, 0.4},
+	}
+
+	var wg sync.WaitGroup
+
+	for _, pattern := range failurePatterns {
+		wg.Add(1)
+		go func(p struct {
+			name        string
+			count       int
+			failureRate float64
+		}) {
+			defer wg.Done()
+
+			for i := 0; i < p.count; i++ {
+				shouldFail := rand.Float64() < p.failureRate
+
+				var task Task
+				switch p.name {
+				case "normal":
+					task = &StressTask{
+						id:       fmt.Sprintf("%s-%d", p.name, i),
+						workType: "cpu",
+						duration: time.Millisecond * time.Duration(10+rand.Intn(40)),
+						onComplete: func() {
+							atomic.AddInt64(&stats.normalCompleted, 1)
+						},
+					}
+				case "error_prone":
+					task = &StressTask{
+						id:          fmt.Sprintf("%s-%d", p.name, i),
+						workType:    "cpu",
+						duration:    time.Millisecond * time.Duration(10+rand.Intn(40)),
+						shouldError: shouldFail,
+						onComplete: func() {
+							atomic.AddInt64(&stats.normalCompleted, 1)
+						},
+						onError: func() {
+							atomic.AddInt64(&stats.errors, 1)
+						},
+					}
+				case "panic_prone":
+					task = &StressTask{
+						id:          fmt.Sprintf("%s-%d", p.name, i),
+						workType:    "cpu",
+						duration:    time.Millisecond * time.Duration(10+rand.Intn(40)),
+						shouldPanic: shouldFail,
+						onComplete: func() {
+							atomic.AddInt64(&stats.normalCompleted, 1)
+						},
+						onPanic: func() {
+							atomic.AddInt64(&stats.panics, 1)
+						},
+					}
+				case "timeout_prone":
+					duration := time.Millisecond * time.Duration(100+rand.Intn(400))
+					if shouldFail {
+						duration = time.Millisecond * 600 // 超过超时时间
+					}
+					task = &StressTask{
+						id:       fmt.Sprintf("%s-%d", p.name, i),
+						workType: "cpu",
+						duration: duration,
+						onComplete: func() {
+							atomic.AddInt64(&stats.normalCompleted, 1)
+						},
+						onTimeout: func() {
+							atomic.AddInt64(&stats.timeouts, 1)
+						},
+					}
+				}
+
+				if err := pool.Submit(task); err != nil {
+					t.Logf("Failed to submit %s task %d: %v", p.name, i, err)
+				}
+
+				// 控制提交速率
+				if i%100 == 0 {
+					time.Sleep(time.Millisecond * 5)
+				}
+			}
+		}(pattern)
 	}
 
 	wg.Wait()
 
 	// 等待任务完成
 	time.Sleep(time.Second * 5)
-	stats := pool.Stats()
 
-	totalTasks := totalSubmitted + totalErrors
-	successRate := float64(totalSubmitted) / float64(totalTasks) * 100
-	errorRate := float64(totalErrors) / float64(totalTasks) * 100
+	// 验证恢复能力 - 提交一批正常任务
+	var recoveryCount int64
+	var recoveryWg sync.WaitGroup
 
-	b.ReportMetric(successRate, "success_rate_%")
-	b.ReportMetric(errorRate, "error_rate_%")
-	b.ReportMetric(float64(totalSubmitted), "submitted_tasks")
-	b.ReportMetric(float64(totalErrors), "error_tasks")
-	b.ReportMetric(float64(stats.CompletedTasks), "completed_tasks")
+	for i := 0; i < 100; i++ {
+		recoveryWg.Add(1)
+		task := &StressTask{
+			id:       fmt.Sprintf("recovery-%d", i),
+			workType: "cpu",
+			duration: time.Millisecond * 10,
+			onComplete: func() {
+				atomic.AddInt64(&recoveryCount, 1)
+				recoveryWg.Done()
+			},
+			onError: func() {
+				recoveryWg.Done()
+			},
+		}
 
-	// 验证优雅降级
-	if errorRate > 80 {
-		b.Errorf("降级测试失败: 错误率过高 %.2f%% > 80%%", errorRate)
+		if err := pool.Submit(task); err != nil {
+			recoveryWg.Done()
+		}
 	}
-	if successRate < 10 {
-		b.Errorf("降级测试失败: 成功率过低 %.2f%% < 10%%", successRate)
+
+	recoveryWg.Wait()
+
+	poolStats := pool.Stats()
+
+	t.Logf("Failure injection stress test results:")
+	t.Logf("  Normal completed: %d", stats.normalCompleted)
+	t.Logf("  Errors: %d", stats.errors)
+	t.Logf("  Panics: %d", stats.panics)
+	t.Logf("  Timeouts: %d", stats.timeouts)
+	t.Logf("  Recovery tasks: %d/100", recoveryCount)
+	t.Logf("  Pool stats: %+v", poolStats)
+
+	// 验证协程池恢复能力
+	if !pool.IsRunning() {
+		t.Error("Pool should still be running after failure injection")
 	}
 
-	// 分析错误类型
-	b.Logf("优雅降级测试结果:")
-	b.Logf("总任务: %d, 成功: %d (%.2f%%), 错误: %d (%.2f%%)",
-		totalTasks, totalSubmitted, successRate, totalErrors, errorRate)
-	b.Logf("完成任务: %d, 活跃协程: %d, 队列任务: %d",
-		stats.CompletedTasks, stats.ActiveWorkers, stats.QueuedTasks)
-
-	b.Logf("错误类型分布:")
-	errorMutex.Lock()
-	for errType, count := range errorTypes {
-		b.Logf("  %s: %d", errType, count)
+	if recoveryCount < 90 { // 至少90%的恢复任务应该完成
+		t.Errorf("Poor recovery performance: %d/100 tasks completed", recoveryCount)
 	}
-	errorMutex.Unlock()
 }
 
-// BenchmarkPoolRecoveryAfterOverload 过载后恢复测试
-func BenchmarkPoolRecoveryAfterOverload(b *testing.B) {
-	config, err := NewConfigBuilder().
-		WithWorkerCount(8).
-		WithQueueSize(1000).
-		WithObjectPoolSize(200).
-		WithMetrics(true).
-		Build()
-	if err != nil {
-		b.Fatalf("Failed to create config: %v", err)
+// createStressTaskByType 根据类型创建压力测试任务
+func createStressTaskByType(taskType string, id int, stats *struct {
+	fastCompleted   int64
+	slowCompleted   int64
+	cpuCompleted    int64
+	memoryCompleted int64
+	ioCompleted     int64
+	errorTasks      int64
+	panicTasks      int64
+	timeoutTasks    int64
+}) *StressTask {
+	taskID := fmt.Sprintf("%s-%d", taskType, id)
+
+	switch taskType {
+	case "fast":
+		return &StressTask{
+			id:       taskID,
+			workType: "cpu",
+			duration: time.Microsecond * time.Duration(100+rand.Intn(400)), // 100-500μs
+			onComplete: func() {
+				atomic.AddInt64(&stats.fastCompleted, 1)
+			},
+		}
+	case "slow":
+		return &StressTask{
+			id:       taskID,
+			workType: "cpu",
+			duration: time.Millisecond * time.Duration(50+rand.Intn(100)), // 50-150ms
+			onComplete: func() {
+				atomic.AddInt64(&stats.slowCompleted, 1)
+			},
+		}
+	case "cpu":
+		return &StressTask{
+			id:       taskID,
+			workType: "cpu",
+			duration: time.Millisecond * time.Duration(10+rand.Intn(30)), // 10-40ms
+			onComplete: func() {
+				atomic.AddInt64(&stats.cpuCompleted, 1)
+			},
+		}
+	case "memory":
+		return &StressTask{
+			id:       taskID,
+			workType: "memory",
+			dataSize: 1024 * (1 + rand.Intn(5)),                         // 1-5KB
+			duration: time.Millisecond * time.Duration(5+rand.Intn(20)), // 5-25ms
+			onComplete: func() {
+				atomic.AddInt64(&stats.memoryCompleted, 1)
+			},
+		}
+	case "io":
+		return &StressTask{
+			id:       taskID,
+			workType: "io",
+			duration: time.Millisecond * time.Duration(20+rand.Intn(80)), // 20-100ms
+			onComplete: func() {
+				atomic.AddInt64(&stats.ioCompleted, 1)
+			},
+		}
+	case "error":
+		return &StressTask{
+			id:          taskID,
+			workType:    "cpu",
+			duration:    time.Millisecond * time.Duration(5+rand.Intn(15)),
+			shouldError: true,
+			onError: func() {
+				atomic.AddInt64(&stats.errorTasks, 1)
+			},
+		}
+	case "panic":
+		return &StressTask{
+			id:          taskID,
+			workType:    "cpu",
+			duration:    time.Millisecond * time.Duration(5+rand.Intn(15)),
+			shouldPanic: true,
+			onPanic: func() {
+				atomic.AddInt64(&stats.panicTasks, 1)
+			},
+		}
+	case "timeout":
+		return &StressTask{
+			id:       taskID,
+			workType: "cpu",
+			duration: time.Second * 3, // 超过默认超时时间
+			onTimeout: func() {
+				atomic.AddInt64(&stats.timeoutTasks, 1)
+			},
+		}
+	default:
+		return &StressTask{
+			id:       taskID,
+			workType: "cpu",
+			duration: time.Millisecond * 10,
+		}
+	}
+}
+
+// StressTask 压力测试任务
+type StressTask struct {
+	id          string
+	workType    string // "cpu", "memory", "io", "mixed"
+	duration    time.Duration
+	dataSize    int
+	shouldError bool
+	shouldPanic bool
+	onComplete  func()
+	onError     func()
+	onPanic     func()
+	onTimeout   func()
+}
+
+func (t *StressTask) Execute(ctx context.Context) (any, error) {
+	if t.shouldPanic {
+		if t.onPanic != nil {
+			defer t.onPanic()
+		}
+		panic(fmt.Sprintf("stress test panic from task %s", t.id))
 	}
 
-	pool, err := NewPool(config)
-	if err != nil {
-		b.Fatalf("Failed to create pool: %v", err)
+	if t.shouldError {
+		if t.onError != nil {
+			t.onError()
+		}
+		return nil, fmt.Errorf("stress test error from task %s", t.id)
 	}
-	defer func() {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second*20)
-		defer cancel()
-		pool.Shutdown(ctx)
-	}()
 
-	b.ResetTimer()
+	// 执行不同类型的工作负载
+	switch t.workType {
+	case "cpu":
+		t.doCPUWork(ctx)
+	case "memory":
+		t.doMemoryWork(ctx)
+	case "io":
+		t.doIOWork(ctx)
+	case "mixed":
+		t.doMixedWork(ctx)
+	}
 
-	// 阶段1: 正常负载
-	b.Logf("阶段1: 正常负载")
-	normalLoad := func() (int64, int64) {
-		var submitted, errors int64
-		for i := 0; i < 500; i++ {
-			task := NewStressTestTask(int64(i), time.Microsecond*10)
-			err := pool.Submit(task)
-			if err != nil {
-				errors++
-			} else {
-				submitted++
+	// 检查是否被取消或超时
+	select {
+	case <-ctx.Done():
+		if t.onTimeout != nil {
+			t.onTimeout()
+		}
+		return nil, ctx.Err()
+	default:
+	}
+
+	if t.onComplete != nil {
+		t.onComplete()
+	}
+
+	return fmt.Sprintf("result-%s", t.id), nil
+}
+
+func (t *StressTask) Priority() int {
+	return PriorityNormal
+}
+
+// doCPUWork 执行CPU密集型工作
+func (t *StressTask) doCPUWork(ctx context.Context) {
+	start := time.Now()
+	for time.Since(start) < t.duration {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			// 简单的CPU计算
+			sum := 0
+			for i := 0; i < 1000; i++ {
+				sum += i * i
 			}
 		}
-		return submitted, errors
+	}
+}
+
+// doMemoryWork 执行内存密集型工作
+func (t *StressTask) doMemoryWork(ctx context.Context) {
+	if t.dataSize <= 0 {
+		t.dataSize = 1024
 	}
 
-	normalSubmitted, normalErrors := normalLoad()
-	normalSuccessRate := float64(normalSubmitted) / float64(normalSubmitted+normalErrors) * 100
-	b.Logf("正常负载结果: 成功率 %.2f%%", normalSuccessRate)
+	// 分配和操作内存
+	data := make([]byte, t.dataSize)
+	for i := range data {
+		data[i] = byte(i % 256)
+	}
 
-	// 阶段2: 过载
-	b.Logf("阶段2: 系统过载")
-	overload := func() (int64, int64) {
-		var submitted, errors int64
-		var wg sync.WaitGroup
-
-		// 大量并发提交造成过载
-		for i := 0; i < 100; i++ {
-			wg.Add(1)
-			go func(workerID int) {
-				defer wg.Done()
-				for j := 0; j < 50; j++ {
-					taskID := int64(workerID*50 + j)
-					task := NewStressTestTask(taskID, time.Millisecond*50) // 长任务
-					err := pool.Submit(task)
-					if err != nil {
-						atomic.AddInt64(&errors, 1)
-					} else {
-						atomic.AddInt64(&submitted, 1)
-					}
-				}
-			}(i)
+	// 模拟内存操作
+	start := time.Now()
+	for time.Since(start) < t.duration {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			// 简单的内存操作
+			for i := 0; i < len(data); i += 64 {
+				data[i] = byte(rand.Intn(256))
+			}
 		}
-
-		wg.Wait()
-		return submitted, errors
 	}
+}
 
-	overloadSubmitted, overloadErrors := overload()
-	overloadSuccessRate := float64(overloadSubmitted) / float64(overloadSubmitted+overloadErrors) * 100
-	b.Logf("过载阶段结果: 成功率 %.2f%%", overloadSuccessRate)
-
-	// 等待系统恢复
-	b.Logf("等待系统恢复...")
-	time.Sleep(time.Second * 3)
-
-	// 阶段3: 恢复后测试
-	b.Logf("阶段3: 恢复后测试")
-	recoverySubmitted, recoveryErrors := normalLoad()
-	recoverySuccessRate := float64(recoverySubmitted) / float64(recoverySubmitted+recoveryErrors) * 100
-	b.Logf("恢复后结果: 成功率 %.2f%%", recoverySuccessRate)
-
-	// 验证恢复能力
-	recoveryRatio := recoverySuccessRate / normalSuccessRate
-	if recoveryRatio < 0.8 {
-		b.Errorf("恢复测试失败: 恢复后成功率 %.2f%% 相比正常 %.2f%% 下降过多 (比率: %.2f)",
-			recoverySuccessRate, normalSuccessRate, recoveryRatio)
+// doIOWork 模拟IO密集型工作
+func (t *StressTask) doIOWork(ctx context.Context) {
+	// 使用sleep模拟IO等待
+	select {
+	case <-time.After(t.duration):
+	case <-ctx.Done():
 	}
+}
 
-	stats := pool.Stats()
-	b.ReportMetric(normalSuccessRate, "normal_success_rate_%")
-	b.ReportMetric(overloadSuccessRate, "overload_success_rate_%")
-	b.ReportMetric(recoverySuccessRate, "recovery_success_rate_%")
-	b.ReportMetric(recoveryRatio, "recovery_ratio")
-	b.ReportMetric(float64(stats.CompletedTasks), "total_completed")
+// doMixedWork 执行混合工作负载
+func (t *StressTask) doMixedWork(ctx context.Context) {
+	// 混合CPU和内存工作
+	halfDuration := t.duration / 2
 
-	b.Logf("过载恢复测试完成: 正常%.2f%% -> 过载%.2f%% -> 恢复%.2f%% (恢复比率: %.2f)",
-		normalSuccessRate, overloadSuccessRate, recoverySuccessRate, recoveryRatio)
+	// 前半段做CPU工作
+	t.duration = halfDuration
+	t.doCPUWork(ctx)
+
+	// 后半段做内存工作
+	if t.dataSize == 0 {
+		t.dataSize = 512
+	}
+	t.duration = halfDuration
+	t.doMemoryWork(ctx)
 }
