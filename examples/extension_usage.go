@@ -4,189 +4,280 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math/rand"
+	"sync/atomic"
 	"time"
 
 	"github.com/uptutu/goman/pkg/pool"
 )
 
-// CustomTask 自定义任务
-type CustomTask struct {
+// ExtensionTask 扩展示例任务
+type ExtensionTask struct {
 	ID       int
 	Name     string
+	TaskType string
 	priority int
+	workFunc func(ctx context.Context) (any, error)
 }
 
-func (ct *CustomTask) Execute(ctx context.Context) (any, error) {
-	// 模拟任务执行
-	fmt.Printf("Executing task %d: %s\n", ct.ID, ct.Name)
-	time.Sleep(100 * time.Millisecond)
-	return fmt.Sprintf("Task %d completed", ct.ID), nil
+func NewExtensionTask(id int, name, taskType string, priority int, workFunc func(ctx context.Context) (any, error)) *ExtensionTask {
+	return &ExtensionTask{
+		ID:       id,
+		Name:     name,
+		TaskType: taskType,
+		priority: priority,
+		workFunc: workFunc,
+	}
 }
 
-func (ct *CustomTask) Priority() int {
-	return ct.priority
+func (et *ExtensionTask) Execute(ctx context.Context) (any, error) {
+	if et.workFunc != nil {
+		return et.workFunc(ctx)
+	}
+
+	// 默认任务执行逻辑
+	processingTime := time.Duration(50+rand.Intn(150)) * time.Millisecond
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-time.After(processingTime):
+		return fmt.Sprintf("Task %d (%s) of type %s completed in %v", et.ID, et.Name, et.TaskType, processingTime), nil
+	}
 }
 
-// CustomMiddleware 自定义中间件
-type CustomMiddleware struct {
-	name string
+func (et *ExtensionTask) Priority() int {
+	return et.priority
 }
 
-func (cm *CustomMiddleware) Before(ctx context.Context, task pool.Task) context.Context {
-	fmt.Printf("[%s] Task started: %v\n", cm.name, task)
-	return context.WithValue(ctx, "start_time", time.Now())
+// TimingMiddleware 计时中间件
+type TimingMiddleware struct {
+	name      string
+	taskCount int64
 }
 
-func (cm *CustomMiddleware) After(ctx context.Context, task pool.Task, result any, err error) {
-	startTime, _ := ctx.Value("start_time").(time.Time)
+func NewTimingMiddleware(name string) *TimingMiddleware {
+	return &TimingMiddleware{name: name}
+}
+
+func (tm *TimingMiddleware) Before(ctx context.Context, task pool.Task) context.Context {
+	atomic.AddInt64(&tm.taskCount, 1)
+	fmt.Printf("[%s] Task #%d started (priority: %d)\n", tm.name, tm.taskCount, task.Priority())
+	return context.WithValue(ctx, "timing_start", time.Now())
+}
+
+func (tm *TimingMiddleware) After(ctx context.Context, task pool.Task, result any, err error) {
+	startTime, ok := ctx.Value("timing_start").(time.Time)
+	if !ok {
+		startTime = time.Now()
+	}
 	duration := time.Since(startTime)
 
 	if err != nil {
-		fmt.Printf("[%s] Task failed after %v: %v\n", cm.name, duration, err)
+		fmt.Printf("[%s] Task failed after %v: %v\n", tm.name, duration, err)
 	} else {
-		fmt.Printf("[%s] Task completed after %v: %v\n", cm.name, duration, result)
+		fmt.Printf("[%s] Task completed after %v\n", tm.name, duration)
 	}
 }
 
-// CustomPlugin 自定义插件
-type CustomPlugin struct {
-	name   string
-	pool   pool.Pool
-	ticker *time.Ticker
-	done   chan struct{}
+// SecurityMiddleware 安全检查中间件
+type SecurityMiddleware struct {
+	name              string
+	blockedTasks      int64
+	allowedTasks      int64
+	maxPriority       int
+	blockHighPriority bool
 }
 
-func NewCustomPlugin(name string, interval time.Duration) *CustomPlugin {
-	return &CustomPlugin{
-		name:   name,
-		ticker: time.NewTicker(interval),
-		done:   make(chan struct{}),
+func NewSecurityMiddleware(name string, maxPriority int, blockHighPriority bool) *SecurityMiddleware {
+	return &SecurityMiddleware{
+		name:              name,
+		maxPriority:       maxPriority,
+		blockHighPriority: blockHighPriority,
 	}
 }
 
-func (cp *CustomPlugin) Name() string {
-	return cp.name
+func (sm *SecurityMiddleware) Before(ctx context.Context, task pool.Task) context.Context {
+	if sm.blockHighPriority && task.Priority() > sm.maxPriority {
+		atomic.AddInt64(&sm.blockedTasks, 1)
+		fmt.Printf("[%s] BLOCKED high priority task (priority: %d > %d)\n", sm.name, task.Priority(), sm.maxPriority)
+		return context.WithValue(ctx, "security_blocked", true)
+	}
+
+	atomic.AddInt64(&sm.allowedTasks, 1)
+	fmt.Printf("[%s] Task security check passed (priority: %d)\n", sm.name, task.Priority())
+	return ctx
 }
 
-func (cp *CustomPlugin) Init(p pool.Pool) error {
-	cp.pool = p
-	fmt.Printf("Plugin %s initialized\n", cp.name)
+func (sm *SecurityMiddleware) After(ctx context.Context, task pool.Task, result any, err error) {
+	if blocked, _ := ctx.Value("security_blocked").(bool); blocked {
+		fmt.Printf("[%s] Blocked task completed with security violation\n", sm.name)
+	}
+}
+
+func (sm *SecurityMiddleware) GetStats() (blocked, allowed int64) {
+	return atomic.LoadInt64(&sm.blockedTasks), atomic.LoadInt64(&sm.allowedTasks)
+}
+
+// PerformanceMonitorPlugin 性能监控插件
+type PerformanceMonitorPlugin struct {
+	name           string
+	pool           pool.Pool
+	ticker         *time.Ticker
+	stopChan       chan struct{}
+	lastCompleted  int64
+	lastFailed     int64
+	peakThroughput float64
+}
+
+func NewPerformanceMonitorPlugin(name string, interval time.Duration) *PerformanceMonitorPlugin {
+	return &PerformanceMonitorPlugin{
+		name:     name,
+		ticker:   time.NewTicker(interval),
+		stopChan: make(chan struct{}),
+	}
+}
+
+func (pmp *PerformanceMonitorPlugin) Name() string {
+	return pmp.name
+}
+
+func (pmp *PerformanceMonitorPlugin) Init(p pool.Pool) error {
+	pmp.pool = p
+	fmt.Printf("[%s] Performance monitor plugin initialized\n", pmp.name)
 	return nil
 }
 
-func (cp *CustomPlugin) Start() error {
-	fmt.Printf("Plugin %s started\n", cp.name)
-	go cp.monitor()
+func (pmp *PerformanceMonitorPlugin) Start() error {
+	fmt.Printf("[%s] Performance monitor plugin started\n", pmp.name)
+	go pmp.monitor()
 	return nil
 }
 
-func (cp *CustomPlugin) Stop() error {
-	fmt.Printf("Plugin %s stopping\n", cp.name)
-	close(cp.done)
-	cp.ticker.Stop()
+func (pmp *PerformanceMonitorPlugin) Stop() error {
+	fmt.Printf("[%s] Performance monitor plugin stopping\n", pmp.name)
+	close(pmp.stopChan)
+	pmp.ticker.Stop()
 	return nil
 }
 
-func (cp *CustomPlugin) monitor() {
+func (pmp *PerformanceMonitorPlugin) monitor() {
 	for {
 		select {
-		case <-cp.ticker.C:
-			if cp.pool != nil {
-				stats := cp.pool.Stats()
-				fmt.Printf("[%s] Pool stats - Active: %d, Queued: %d, Completed: %d\n",
-					cp.name, stats.ActiveWorkers, stats.QueuedTasks, stats.CompletedTasks)
+		case <-pmp.ticker.C:
+			if pmp.pool != nil {
+				stats := pmp.pool.Stats()
+
+				// 计算增量吞吐量
+				completedDelta := stats.CompletedTasks - pmp.lastCompleted
+				failedDelta := stats.FailedTasks - pmp.lastFailed
+
+				if stats.ThroughputTPS > pmp.peakThroughput {
+					pmp.peakThroughput = stats.ThroughputTPS
+				}
+
+				fmt.Printf("[%s] Performance Report:\n", pmp.name)
+				fmt.Printf("  - Active Workers: %d\n", stats.ActiveWorkers)
+				fmt.Printf("  - Queue Length: %d\n", stats.QueuedTasks)
+				fmt.Printf("  - Completed (Δ): %d (+%d)\n", stats.CompletedTasks, completedDelta)
+				fmt.Printf("  - Failed (Δ): %d (+%d)\n", stats.FailedTasks, failedDelta)
+				fmt.Printf("  - Current TPS: %.2f\n", stats.ThroughputTPS)
+				fmt.Printf("  - Peak TPS: %.2f\n", pmp.peakThroughput)
+				fmt.Printf("  - Avg Duration: %v\n", stats.AvgTaskDuration)
+				fmt.Printf("  - Memory Usage: %d bytes\n", stats.MemoryUsage)
+				fmt.Println()
+
+				pmp.lastCompleted = stats.CompletedTasks
+				pmp.lastFailed = stats.FailedTasks
 			}
-		case <-cp.done:
+		case <-pmp.stopChan:
 			return
 		}
 	}
 }
 
-// CustomEventListener 自定义事件监听器
-type CustomEventListener struct {
-	name string
+// DetailedEventListener 详细事件监听器
+type DetailedEventListener struct {
+	name        string
+	eventCounts map[string]int64
+	startTime   time.Time
 }
 
-func (cel *CustomEventListener) OnPoolStart(p pool.Pool) {
-	fmt.Printf("[%s] Pool started\n", cel.name)
+func NewDetailedEventListener(name string) *DetailedEventListener {
+	return &DetailedEventListener{
+		name:        name,
+		eventCounts: make(map[string]int64),
+		startTime:   time.Now(),
+	}
 }
 
-func (cel *CustomEventListener) OnPoolShutdown(p pool.Pool) {
-	fmt.Printf("[%s] Pool shutdown\n", cel.name)
+func (del *DetailedEventListener) OnPoolStart(p pool.Pool) {
+	atomic.AddInt64(&del.eventCounts["pool_start"], 1)
+	fmt.Printf("[%s] 🚀 Pool started at %v\n", del.name, time.Now().Format("15:04:05"))
 }
 
-func (cel *CustomEventListener) OnTaskSubmit(task pool.Task) {
-	fmt.Printf("[%s] Task submitted: priority=%d\n", cel.name, task.Priority())
+func (del *DetailedEventListener) OnPoolShutdown(p pool.Pool) {
+	atomic.AddInt64(&del.eventCounts["pool_shutdown"], 1)
+	uptime := time.Since(del.startTime)
+	fmt.Printf("[%s] 🛑 Pool shutdown after %v uptime\n", del.name, uptime)
 }
 
-func (cel *CustomEventListener) OnTaskComplete(task pool.Task, result any) {
-	fmt.Printf("[%s] Task completed: priority=%d, result=%v\n", cel.name, task.Priority(), result)
+func (del *DetailedEventListener) OnTaskSubmit(task pool.Task) {
+	atomic.AddInt64(&del.eventCounts["task_submit"], 1)
+	fmt.Printf("[%s] 📥 Task submitted (priority: %d)\n", del.name, task.Priority())
 }
 
-func (cel *CustomEventListener) OnWorkerPanic(workerID int, panicValue any) {
-	fmt.Printf("[%s] Worker %d panicked: %v\n", cel.name, workerID, panicValue)
+func (del *DetailedEventListener) OnTaskComplete(task pool.Task, result any) {
+	atomic.AddInt64(&del.eventCounts["task_complete"], 1)
+	fmt.Printf("[%s] ✅ Task completed (priority: %d)\n", del.name, task.Priority())
 }
 
-// CustomSchedulerPlugin 自定义调度器插件
-type CustomSchedulerPlugin struct {
-	name     string
-	priority int
+func (del *DetailedEventListener) OnWorkerPanic(workerID int, panicValue any) {
+	atomic.AddInt64(&del.eventCounts["worker_panic"], 1)
+	fmt.Printf("[%s] 💥 Worker %d panicked: %v\n", del.name, workerID, panicValue)
 }
 
-func (csp *CustomSchedulerPlugin) Name() string {
-	return csp.name
-}
-
-func (csp *CustomSchedulerPlugin) CreateScheduler(config *pool.Config) (pool.Scheduler, error) {
-	fmt.Printf("Creating custom scheduler with config: workers=%d, queue=%d\n",
-		config.WorkerCount, config.QueueSize)
-	return &CustomScheduler{}, nil
-}
-
-func (csp *CustomSchedulerPlugin) Priority() int {
-	return csp.priority
-}
-
-// CustomScheduler 自定义调度器
-type CustomScheduler struct{}
-
-func (cs *CustomScheduler) Schedule(task pool.Task) error {
-	fmt.Printf("Custom scheduler scheduling task with priority %d\n", task.Priority())
-	return nil
-}
-
-func (cs *CustomScheduler) Start() error {
-	fmt.Println("Custom scheduler started")
-	return nil
-}
-
-func (cs *CustomScheduler) Stop() error {
-	fmt.Println("Custom scheduler stopped")
-	return nil
+func (del *DetailedEventListener) GetEventCounts() map[string]int64 {
+	result := make(map[string]int64)
+	for k, v := range del.eventCounts {
+		result[k] = atomic.LoadInt64(&v)
+	}
+	return result
 }
 
 func main() {
 	fmt.Println("=== Goroutine Pool Extension Usage Example ===")
 
 	// 创建协程池配置
-	config := &pool.Config{
-		WorkerCount:     3,
-		QueueSize:       10,
-		EnableMetrics:   true,
-		MetricsInterval: 1 * time.Second,
+	config, err := pool.NewConfigBuilder().
+		WithWorkerCount(4).
+		WithQueueSize(20).
+		WithTaskTimeout(5 * time.Second).
+		WithMetrics(true).
+		WithMetricsInterval(2 * time.Second).
+		Build()
+
+	if err != nil {
+		log.Fatalf("Failed to create config: %v", err)
 	}
 
 	// 创建协程池
-	p, err := pool.New(config)
+	p, err := pool.NewPool(config)
 	if err != nil {
 		log.Fatalf("Failed to create pool: %v", err)
 	}
 
-	fmt.Println("\n1. Adding middleware...")
+	fmt.Printf("Pool created with %d workers\n", config.WorkerCount)
 
-	// 添加自定义中间件
-	customMiddleware := &CustomMiddleware{name: "CustomMiddleware"}
-	p.AddMiddleware(customMiddleware)
+	// 1. 添加中间件
+	fmt.Println("\n=== 1. Adding Middleware ===")
+
+	// 添加计时中间件
+	timingMiddleware := NewTimingMiddleware("TimingMiddleware")
+	p.AddMiddleware(timingMiddleware)
+
+	// 添加安全中间件
+	securityMiddleware := NewSecurityMiddleware("SecurityMiddleware", pool.PriorityNormal, false)
+	p.AddMiddleware(securityMiddleware)
 
 	// 添加内置日志中间件
 	loggingMiddleware := pool.NewLoggingMiddleware(nil)
@@ -196,123 +287,189 @@ func main() {
 	metricsMiddleware := pool.NewMetricsMiddleware()
 	p.AddMiddleware(metricsMiddleware)
 
-	fmt.Println("\n2. Registering plugins...")
+	fmt.Println("All middleware added successfully")
 
-	// 注册自定义插件
-	customPlugin := NewCustomPlugin("CustomMonitor", 2*time.Second)
-	err = p.RegisterPlugin(customPlugin)
+	// 2. 注册插件
+	fmt.Println("\n=== 2. Registering Plugins ===")
+
+	// 注册性能监控插件
+	perfMonitor := NewPerformanceMonitorPlugin("PerfMonitor", 3*time.Second)
+	err = p.RegisterPlugin(perfMonitor)
 	if err != nil {
-		log.Fatalf("Failed to register custom plugin: %v", err)
+		log.Fatalf("Failed to register performance monitor plugin: %v", err)
 	}
 
 	// 注册内置监控插件
-	monitoringPlugin := pool.NewMonitoringPlugin("BuiltinMonitor", 3*time.Second, nil)
-	err = p.RegisterPlugin(monitoringPlugin)
+	builtinMonitor := pool.NewMonitoringPlugin("BuiltinMonitor", 4*time.Second, nil)
+	err = p.RegisterPlugin(builtinMonitor)
 	if err != nil {
-		log.Fatalf("Failed to register monitoring plugin: %v", err)
+		log.Fatalf("Failed to register builtin monitor plugin: %v", err)
 	}
 
-	fmt.Println("\n3. Adding event listeners...")
+	fmt.Println("All plugins registered successfully")
 
-	// 添加自定义事件监听器
-	customListener := &CustomEventListener{name: "CustomListener"}
-	p.AddEventListener(customListener)
+	// 3. 添加事件监听器
+	fmt.Println("\n=== 3. Adding Event Listeners ===")
+
+	// 添加详细事件监听器
+	detailedListener := NewDetailedEventListener("DetailedListener")
+	p.AddEventListener(detailedListener)
 
 	// 添加内置日志事件监听器
 	loggingListener := pool.NewLoggingEventListener(nil)
 	p.AddEventListener(loggingListener)
 
-	fmt.Println("\n4. Setting scheduler plugin...")
+	fmt.Println("All event listeners added successfully")
 
-	// 设置自定义调度器插件
-	schedulerPlugin := &CustomSchedulerPlugin{
-		name:     "CustomScheduler",
-		priority: 10,
-	}
-	p.SetSchedulerPlugin(schedulerPlugin)
+	// 4. 提交各种类型的任务
+	fmt.Println("\n=== 4. Submitting Various Task Types ===")
 
-	fmt.Println("\n5. Submitting tasks...")
-
-	// 提交一些任务
-	for i := 0; i < 5; i++ {
-		task := &CustomTask{
-			ID:       i + 1,
-			Name:     fmt.Sprintf("Task-%d", i+1),
-			priority: i % 3,
+	// 提交普通任务
+	for i := 1; i <= 3; i++ {
+		task := NewExtensionTask(i, fmt.Sprintf("normal-task-%d", i), "NORMAL", pool.PriorityNormal, nil)
+		if err := p.Submit(task); err != nil {
+			fmt.Printf("Failed to submit normal task %d: %v\n", i, err)
 		}
-
-		err := p.Submit(task)
-		if err != nil {
-			fmt.Printf("Failed to submit task %d: %v\n", i+1, err)
-		}
-
-		// 稍微延迟以便观察输出
-		time.Sleep(50 * time.Millisecond)
 	}
 
-	fmt.Println("\n6. Waiting for tasks to complete...")
-	time.Sleep(3 * time.Second)
+	// 提交高优先级任务
+	for i := 1; i <= 2; i++ {
+		task := NewExtensionTask(10+i, fmt.Sprintf("high-priority-task-%d", i), "HIGH", pool.PriorityHigh,
+			func(ctx context.Context) (any, error) {
+				time.Sleep(200 * time.Millisecond)
+				return "High priority task completed with extra processing", nil
+			})
+		if err := p.Submit(task); err != nil {
+			fmt.Printf("Failed to submit high priority task %d: %v\n", i, err)
+		}
+	}
 
-	fmt.Println("\n7. Getting metrics...")
+	// 提交会失败的任务
+	failTask := NewExtensionTask(20, "fail-task", "ERROR", pool.PriorityNormal,
+		func(ctx context.Context) (any, error) {
+			time.Sleep(100 * time.Millisecond)
+			return nil, fmt.Errorf("intentional task failure for testing")
+		})
+	if err := p.Submit(failTask); err != nil {
+		fmt.Printf("Failed to submit fail task: %v\n", err)
+	}
 
-	// 获取指标中间件的统计信息
+	// 提交会panic的任务
+	panicTask := NewExtensionTask(21, "panic-task", "PANIC", pool.PriorityLow,
+		func(ctx context.Context) (any, error) {
+			time.Sleep(50 * time.Millisecond)
+			panic("intentional panic for testing middleware and event handling")
+		})
+	if err := p.Submit(panicTask); err != nil {
+		fmt.Printf("Failed to submit panic task: %v\n", err)
+	}
+
+	// 提交CPU密集型任务
+	cpuTask := NewExtensionTask(22, "cpu-intensive-task", "CPU", pool.PriorityNormal,
+		func(ctx context.Context) (any, error) {
+			result := int64(0)
+			for i := 0; i < 500000; i++ {
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				default:
+					result += int64(i * i)
+				}
+			}
+			return fmt.Sprintf("CPU intensive task completed: result=%d", result%1000000), nil
+		})
+	if err := p.Submit(cpuTask); err != nil {
+		fmt.Printf("Failed to submit CPU task: %v\n", err)
+	}
+
+	// 5. 等待任务执行并观察扩展功能
+	fmt.Println("\n=== 5. Observing Extension Functionality ===")
+	time.Sleep(8 * time.Second)
+
+	// 6. 获取各种统计信息
+	fmt.Println("\n=== 6. Extension Statistics ===")
+
+	// 获取指标中间件统计
 	metrics := metricsMiddleware.GetMetrics()
-	fmt.Printf("Metrics - Tasks: %d, Success: %d, Failure: %d, Avg Duration: %v, Success Rate: %.2f%%\n",
-		metrics.TaskCount, metrics.SuccessCount, metrics.FailureCount,
-		metrics.AvgDuration, metrics.SuccessRate*100)
+	fmt.Printf("Metrics Middleware Stats:\n")
+	fmt.Printf("  - Total Tasks: %d\n", metrics.TaskCount)
+	fmt.Printf("  - Successful: %d\n", metrics.SuccessCount)
+	fmt.Printf("  - Failed: %d\n", metrics.FailureCount)
+	fmt.Printf("  - Average Duration: %v\n", metrics.AvgDuration)
+	fmt.Printf("  - Success Rate: %.2f%%\n", metrics.SuccessRate*100)
 
-	// 获取协程池统计信息
-	stats := p.Stats()
-	fmt.Printf("Pool Stats - Active: %d, Queued: %d, Completed: %d, Failed: %d, TPS: %.2f\n",
-		stats.ActiveWorkers, stats.QueuedTasks, stats.CompletedTasks, stats.FailedTasks, stats.ThroughputTPS)
+	// 获取安全中间件统计
+	blocked, allowed := securityMiddleware.GetStats()
+	fmt.Printf("\nSecurity Middleware Stats:\n")
+	fmt.Printf("  - Blocked Tasks: %d\n", blocked)
+	fmt.Printf("  - Allowed Tasks: %d\n", allowed)
 
-	fmt.Println("\n8. Testing plugin management...")
+	// 获取事件监听器统计
+	eventCounts := detailedListener.GetEventCounts()
+	fmt.Printf("\nEvent Listener Stats:\n")
+	for event, count := range eventCounts {
+		fmt.Printf("  - %s: %d\n", event, count)
+	}
+
+	// 获取协程池统计
+	poolStats := p.Stats()
+	fmt.Printf("\nPool Stats:\n")
+	fmt.Printf("  - Active Workers: %d\n", poolStats.ActiveWorkers)
+	fmt.Printf("  - Queued Tasks: %d\n", poolStats.QueuedTasks)
+	fmt.Printf("  - Completed Tasks: %d\n", poolStats.CompletedTasks)
+	fmt.Printf("  - Failed Tasks: %d\n", poolStats.FailedTasks)
+	fmt.Printf("  - Throughput: %.2f TPS\n", poolStats.ThroughputTPS)
+
+	// 7. 测试插件管理
+	fmt.Println("\n=== 7. Testing Plugin Management ===")
 
 	// 获取插件
-	plugin, exists := p.GetPlugin("CustomMonitor")
-	if exists {
+	if plugin, exists := p.GetPlugin("PerfMonitor"); exists {
 		fmt.Printf("Found plugin: %s\n", plugin.Name())
 	}
 
 	// 注销插件
-	err = p.UnregisterPlugin("CustomMonitor")
-	if err != nil {
+	if err := p.UnregisterPlugin("PerfMonitor"); err != nil {
 		fmt.Printf("Failed to unregister plugin: %v\n", err)
 	} else {
-		fmt.Println("Plugin unregistered successfully")
+		fmt.Println("Performance monitor plugin unregistered successfully")
 	}
 
-	fmt.Println("\n9. Testing middleware removal...")
+	// 8. 测试中间件移除
+	fmt.Println("\n=== 8. Testing Middleware Removal ===")
 
-	// 移除中间件
-	p.RemoveMiddleware(customMiddleware)
-	fmt.Println("Custom middleware removed")
+	// 移除安全中间件
+	p.RemoveMiddleware(securityMiddleware)
+	fmt.Println("Security middleware removed")
 
-	// 提交一个任务验证中间件已移除
-	task := &CustomTask{
-		ID:       99,
-		Name:     "Final Task",
-		priority: 1,
-	}
-	err = p.Submit(task)
-	if err != nil {
-		fmt.Printf("Failed to submit final task: %v\n", err)
+	// 提交一个高优先级任务验证安全中间件已移除
+	testTask := NewExtensionTask(99, "test-after-removal", "TEST", pool.PriorityCritical, nil)
+	if err := p.Submit(testTask); err != nil {
+		fmt.Printf("Failed to submit test task: %v\n", err)
+	} else {
+		fmt.Println("High priority task submitted successfully after security middleware removal")
 	}
 
-	time.Sleep(1 * time.Second)
+	time.Sleep(2 * time.Second)
 
-	fmt.Println("\n10. Shutting down...")
-
-	// 优雅关闭协程池
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// 9. 优雅关闭
+	fmt.Println("\n=== 9. Graceful Shutdown ===")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	err = p.Shutdown(ctx)
-	if err != nil {
+	if err := p.Shutdown(shutdownCtx); err != nil {
 		fmt.Printf("Failed to shutdown pool: %v\n", err)
 	} else {
 		fmt.Println("Pool shutdown successfully")
 	}
+
+	// 最终统计
+	fmt.Println("\n=== Final Statistics ===")
+	finalStats := p.Stats()
+	fmt.Printf("Final Pool Stats:\n")
+	fmt.Printf("  - Total Completed: %d\n", finalStats.CompletedTasks)
+	fmt.Printf("  - Total Failed: %d\n", finalStats.FailedTasks)
+	fmt.Printf("  - Final Memory Usage: %d bytes\n", finalStats.MemoryUsage)
 
 	fmt.Println("\n=== Extension Usage Example Completed ===")
 }
