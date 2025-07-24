@@ -1347,6 +1347,6 @@ func (t *FinalPerformanceBenchmarkTask) Execute(ctx context.Context) (any, error
 	return fmt.Sprintf("result-%s", t.id), nil
 }
 
-func (t *PerformanceBenchmarkTask) Priority() int {
+func (t *FinalPerformanceBenchmarkTask) Priority() int {
 	return PriorityNormal
 }

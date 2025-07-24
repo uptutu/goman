@@ -65,6 +65,18 @@ func (p *MockPool) SubmitWithTimeout(task pool.Task, timeout time.Duration) erro
 func (p *MockPool) SubmitAsync(task pool.Task) pool.Future                        { return nil }
 func (p *MockPool) Shutdown(ctx context.Context) error                            { return nil }
 func (p *MockPool) Stats() pool.PoolStats                                         { return pool.PoolStats{} }
+func (p *MockPool) IsRunning() bool                                               { return true }
+func (p *MockPool) IsShutdown() bool                                              { return false }
+func (p *MockPool) IsClosed() bool                                                { return false }
+func (p *MockPool) AddMiddleware(middleware pool.Middleware)                      {}
+func (p *MockPool) RemoveMiddleware(middleware pool.Middleware)                   {}
+func (p *MockPool) RegisterPlugin(plugin pool.Plugin) error                       { return nil }
+func (p *MockPool) UnregisterPlugin(name string) error                            { return nil }
+func (p *MockPool) GetPlugin(name string) (pool.Plugin, bool)                     { return nil, false }
+func (p *MockPool) AddEventListener(listener pool.EventListener)                  {}
+func (p *MockPool) RemoveEventListener(listener pool.EventListener)               {}
+func (p *MockPool) SetSchedulerPlugin(plugin pool.SchedulerPlugin)                {}
+func (p *MockPool) GetSchedulerPlugin() pool.SchedulerPlugin                      { return nil }
 
 // MockErrorHandler 模拟错误处理器
 type MockErrorHandler struct {
@@ -99,6 +111,14 @@ func (h *MockErrorHandler) TimeoutCalls() int32 {
 	return atomic.LoadInt32(&h.timeoutCalls)
 }
 
+func (h *MockErrorHandler) GetStats() pool.ErrorStats {
+	return pool.ErrorStats{
+		PanicCount:     int64(atomic.LoadInt32(&h.panicCalls)),
+		TimeoutCount:   int64(atomic.LoadInt32(&h.timeoutCalls)),
+		QueueFullCount: int64(atomic.LoadInt32(&h.queueCalls)),
+	}
+}
+
 // MockMonitor 模拟监控器
 type MockMonitor struct {
 	submitCalls   int32
@@ -129,6 +149,14 @@ func (m *MockMonitor) CompleteCalls() int32 {
 func (m *MockMonitor) FailCalls() int32 {
 	return atomic.LoadInt32(&m.failCalls)
 }
+
+func (m *MockMonitor) Start() {}
+
+func (m *MockMonitor) Stop() {}
+
+func (m *MockMonitor) SetActiveWorkers(count int64) {}
+
+func (m *MockMonitor) SetQueuedTasks(count int64) {}
 
 // 测试工作协程创建
 func TestNewWorker(t *testing.T) {

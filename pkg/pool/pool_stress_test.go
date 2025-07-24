@@ -498,7 +498,7 @@ func testMixedWorkloadStress(t *testing.T) {
 				atomic.LoadInt64(&stats.panicTasks) +
 				atomic.LoadInt64(&stats.timeoutTasks)
 
-			if total >= int64(len(taskTypes)*200*0.9) { // 90%完成即可
+			if total >= int64(float64(len(taskTypes)*200)*0.9) { // 90%完成即可
 				goto results
 			}
 		}

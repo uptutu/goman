@@ -2,6 +2,7 @@ package pool
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"runtime"
 	"sync"
@@ -610,13 +611,16 @@ func (p *pool) Stats() PoolStats {
 	// 更新实时统计信息
 	p.updateStats()
 
+	// 获取监控器的统计信息（包含任务完成和失败数据）
+	monitorStats := p.monitor.GetStats()
+
 	return PoolStats{
 		ActiveWorkers:   atomic.LoadInt64(&p.stats.activeWorkers),
 		QueuedTasks:     atomic.LoadInt64(&p.stats.queuedTasks),
-		CompletedTasks:  atomic.LoadInt64(&p.stats.completedTasks),
-		FailedTasks:     atomic.LoadInt64(&p.stats.failedTasks),
-		AvgTaskDuration: time.Duration(atomic.LoadInt64(&p.stats.avgTaskDuration)),
-		ThroughputTPS:   p.stats.throughputTPS,
+		CompletedTasks:  monitorStats.CompletedTasks,
+		FailedTasks:     monitorStats.FailedTasks,
+		AvgTaskDuration: monitorStats.AvgTaskDuration,
+		ThroughputTPS:   monitorStats.ThroughputTPS,
 		MemoryUsage:     atomic.LoadInt64(&p.stats.memoryUsage),
 		GCCount:         atomic.LoadInt64(&p.stats.gcCount),
 	}
@@ -1021,8 +1025,14 @@ func (w *poolWorker) executeTask(taskWrapper *poolTaskWrapper) {
 	// 执行任务
 	result, err = taskWrapper.task.Execute(taskCtx)
 
-	// 检查是否超时
-	if err != nil && taskCtx.Err() == context.DeadlineExceeded {
+	// 检查是否超时 - 优先检查上下文状态
+	if taskCtx.Err() == context.DeadlineExceeded {
+		err = NewTimeoutError(w.config.TaskTimeout, taskWrapper.task)
+		if w.errorHandler != nil {
+			w.errorHandler.HandleTimeout(taskWrapper.task, w.config.TaskTimeout)
+		}
+	} else if err != nil && errors.Is(err, context.DeadlineExceeded) {
+		// 如果任务返回了超时错误，也转换为TimeoutError
 		err = NewTimeoutError(w.config.TaskTimeout, taskWrapper.task)
 		if w.errorHandler != nil {
 			w.errorHandler.HandleTimeout(taskWrapper.task, w.config.TaskTimeout)
@@ -1077,7 +1087,9 @@ func (w *poolWorker) recycleTaskWrapper(wrapper *poolTaskWrapper) {
 	wrapper.priority = 0
 
 	// 回收到对象池
-	w.pool.objectPool.taskPool.Put(wrapper)
+	if w.pool.objectPool != nil && w.pool.objectPool.taskPool != nil {
+		w.pool.objectPool.taskPool.Put(wrapper)
+	}
 }
 
 // cleanup 清理资源
@@ -1163,10 +1175,16 @@ func (s *poolScheduler) schedule(task Task) error {
 	// 创建任务包装器
 	taskWrapper := s.pool.objectPool.taskPool.Get().(*poolTaskWrapper)
 	taskWrapper.task = task
-	taskWrapper.future = s.pool.objectPool.futurePool.Get().(*poolFuture)
 	taskWrapper.submitTime = time.Now()
 	taskWrapper.priority = task.Priority()
 	taskWrapper.ctx = s.pool.ctx
+
+	// 检查是否是异步任务，如果是则使用其Future，否则创建新的Future
+	if asyncTask, ok := task.(*asyncTask); ok {
+		taskWrapper.future = asyncTask.future
+	} else {
+		taskWrapper.future = s.pool.objectPool.futurePool.Get().(*poolFuture)
+	}
 
 	// 尝试直接分配给工作协程
 	if s.tryDirectSchedule(taskWrapper) {
@@ -1290,12 +1308,9 @@ type asyncTask struct {
 }
 
 func (t *asyncTask) Execute(ctx context.Context) (any, error) {
-	result, err := t.originalTask.Execute(ctx)
-
-	// 设置Future结果
-	t.future.setResult(result, err)
-
-	return result, err
+	// 执行原始任务，但不设置Future结果
+	// Future结果将由worker在超时转换后设置
+	return t.originalTask.Execute(ctx)
 }
 
 func (t *asyncTask) Priority() int {

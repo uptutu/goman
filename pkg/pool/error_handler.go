@@ -82,6 +82,9 @@ func (h *defaultErrorHandler) HandleQueueFull(task Task) error {
 	h.logger.Printf("Task queue is full, rejecting task with priority: %d",
 		task.Priority())
 
+	// 记录队列满失败到熔断器
+	h.circuitBreaker.RecordFailure()
+
 	// 返回队列满错误，让调用者决定如何处理
 	return NewPoolError("submit", ErrQueueFull)
 }

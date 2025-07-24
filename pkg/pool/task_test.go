@@ -66,10 +66,10 @@ func testBasicTaskExecution(t *testing.T) {
 		task := &TestTask{
 			id:       fmt.Sprintf("sync-%d", i),
 			duration: time.Millisecond * 10,
-			onExecute: func() {
-				atomic.AddInt64(&executed, 1)
-				wg.Done()
-			},
+		}
+		task.onExecute = func() {
+			atomic.AddInt64(&executed, 1)
+			wg.Done()
 		}
 
 		if err := pool.Submit(task); err != nil {
@@ -150,14 +150,13 @@ func testTaskPriorityHandling(t *testing.T) {
 			id:       taskInfo.id,
 			priority: taskInfo.priority,
 			duration: time.Millisecond * 10,
-			onExecute: func(id string) {
+			executeCallback: func(id string) {
 				mu.Lock()
 				executionOrder = append(executionOrder, id)
 				mu.Unlock()
 				wg.Done()
 			},
 		}
-		task.executeCallback = task.onExecute
 
 		pool.Submit(task)
 	}
@@ -447,65 +446,4 @@ func testTaskPanicRecovery(t *testing.T) {
 	if !recovered {
 		t.Error("Pool did not recover properly after panic")
 	}
-}
-
-// TestTask 测试任务
-type TestTask struct {
-	id              string
-	duration        time.Duration
-	result          any
-	priority        int
-	shouldError     bool
-	shouldPanic     bool
-	onExecute       func()
-	onError         func()
-	onTimeout       func()
-	onPanic         func()
-	executeCallback func(string)
-}
-
-func (t *TestTask) Execute(ctx context.Context) (any, error) {
-	if t.shouldPanic {
-		if t.onPanic != nil {
-			defer t.onPanic()
-		}
-		panic(fmt.Sprintf("test panic from task %s", t.id))
-	}
-
-	if t.shouldError {
-		if t.onError != nil {
-			t.onError()
-		}
-		return nil, fmt.Errorf("test error from task %s", t.id)
-	}
-
-	if t.duration > 0 {
-		select {
-		case <-time.After(t.duration):
-		case <-ctx.Done():
-			if t.onTimeout != nil {
-				t.onTimeout()
-			}
-			return nil, ctx.Err()
-		}
-	}
-
-	if t.executeCallback != nil {
-		t.executeCallback(t.id)
-	} else if t.onExecute != nil {
-		t.onExecute()
-	}
-
-	if t.result != nil {
-		return t.result, nil
-	}
-
-	return fmt.Sprintf("result-%s", t.id), nil
-}
-
-func (t *TestTask) Priority() int {
-	if t.priority != 0 {
-		return t.priority
-	}
-	return PriorityNormal
 }

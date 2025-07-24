@@ -69,6 +69,14 @@ func (m *MockMonitor) GetStats() pool.PoolStats {
 	return pool.PoolStats{}
 }
 
+func (m *MockMonitor) Start() {}
+
+func (m *MockMonitor) Stop() {}
+
+func (m *MockMonitor) SetActiveWorkers(count int64) {}
+
+func (m *MockMonitor) SetQueuedTasks(count int64) {}
+
 // MockErrorHandler 模拟错误处理器
 type MockErrorHandler struct {
 	panicCount     int64
@@ -87,6 +95,14 @@ func (h *MockErrorHandler) HandleTimeout(task pool.Task, duration time.Duration)
 func (h *MockErrorHandler) HandleQueueFull(task pool.Task) error {
 	atomic.AddInt64(&h.queueFullCount, 1)
 	return pool.ErrQueueFull
+}
+
+func (h *MockErrorHandler) GetStats() pool.ErrorStats {
+	return pool.ErrorStats{
+		PanicCount:     atomic.LoadInt64(&h.panicCount),
+		TimeoutCount:   atomic.LoadInt64(&h.timeoutCount),
+		QueueFullCount: atomic.LoadInt64(&h.queueFullCount),
+	}
 }
 
 // 创建测试用的调度器

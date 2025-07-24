@@ -12,12 +12,19 @@ import (
 
 // TestTask 测试任务实现
 type TestTask struct {
-	id       string
-	duration time.Duration
-	priority int
-	result   any
-	err      error
-	executed int32
+	id              string
+	duration        time.Duration
+	priority        int
+	result          any
+	err             error
+	executed        int32
+	shouldError     bool
+	shouldPanic     bool
+	onExecute       func()
+	onError         func()
+	onTimeout       func()
+	onPanic         func()
+	executeCallback func(string)
 }
 
 func NewTestTask(id string, duration time.Duration) *TestTask {
@@ -31,12 +38,35 @@ func NewTestTask(id string, duration time.Duration) *TestTask {
 func (t *TestTask) Execute(ctx context.Context) (any, error) {
 	atomic.StoreInt32(&t.executed, 1)
 
+	if t.shouldPanic {
+		if t.onPanic != nil {
+			defer t.onPanic()
+		}
+		panic(fmt.Sprintf("test panic from task %s", t.id))
+	}
+
+	if t.shouldError {
+		if t.onError != nil {
+			t.onError()
+		}
+		return nil, fmt.Errorf("test error from task %s", t.id)
+	}
+
 	if t.duration > 0 {
 		select {
 		case <-time.After(t.duration):
 		case <-ctx.Done():
+			if t.onTimeout != nil {
+				t.onTimeout()
+			}
 			return nil, ctx.Err()
 		}
+	}
+
+	if t.executeCallback != nil {
+		t.executeCallback(t.id)
+	} else if t.onExecute != nil {
+		t.onExecute()
 	}
 
 	if t.err != nil {

@@ -211,35 +211,42 @@ func NewDetailedEventListener(name string) *DetailedEventListener {
 }
 
 func (del *DetailedEventListener) OnPoolStart(p pool.Pool) {
-	atomic.AddInt64(&del.eventCounts["pool_start"], 1)
+	del.incrementEventCount("pool_start")
 	fmt.Printf("[%s] 🚀 Pool started at %v\n", del.name, time.Now().Format("15:04:05"))
 }
 
 func (del *DetailedEventListener) OnPoolShutdown(p pool.Pool) {
-	atomic.AddInt64(&del.eventCounts["pool_shutdown"], 1)
+	del.incrementEventCount("pool_shutdown")
 	uptime := time.Since(del.startTime)
 	fmt.Printf("[%s] 🛑 Pool shutdown after %v uptime\n", del.name, uptime)
 }
 
 func (del *DetailedEventListener) OnTaskSubmit(task pool.Task) {
-	atomic.AddInt64(&del.eventCounts["task_submit"], 1)
+	del.incrementEventCount("task_submit")
 	fmt.Printf("[%s] 📥 Task submitted (priority: %d)\n", del.name, task.Priority())
 }
 
 func (del *DetailedEventListener) OnTaskComplete(task pool.Task, result any) {
-	atomic.AddInt64(&del.eventCounts["task_complete"], 1)
+	del.incrementEventCount("task_complete")
 	fmt.Printf("[%s] ✅ Task completed (priority: %d)\n", del.name, task.Priority())
 }
 
 func (del *DetailedEventListener) OnWorkerPanic(workerID int, panicValue any) {
-	atomic.AddInt64(&del.eventCounts["worker_panic"], 1)
+	del.incrementEventCount("worker_panic")
 	fmt.Printf("[%s] 💥 Worker %d panicked: %v\n", del.name, workerID, panicValue)
+}
+
+func (del *DetailedEventListener) incrementEventCount(eventType string) {
+	if _, exists := del.eventCounts[eventType]; !exists {
+		del.eventCounts[eventType] = 0
+	}
+	del.eventCounts[eventType]++
 }
 
 func (del *DetailedEventListener) GetEventCounts() map[string]int64 {
 	result := make(map[string]int64)
 	for k, v := range del.eventCounts {
-		result[k] = atomic.LoadInt64(&v)
+		result[k] = v
 	}
 	return result
 }
